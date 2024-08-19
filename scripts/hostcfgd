@@ -89,6 +89,11 @@ DEFAULT_FIPS_RESTART_SERVICES = ['ssh', 'telemetry.service', 'restapi']
 CFG_DB = "CONFIG_DB"
 STATE_DB = "STATE_DB"
 
+# HOSTS ACCESS CONTROL
+HOSTS_ALLOW_TEMPLATE = "/usr/share/sonic/templates/hosts.allow.j2"
+HOSTS_DENY_TEMPLATE = "/usr/share/sonic/templates/hosts.deny.j2"
+HOSTS_ALLOW_FILE = "/etc/hosts.allow"
+HOSTS_DENY_FILE = "/etc/hosts.deny"
 
 def signal_handler(sig, frame):
     if sig == signal.SIGHUP:
@@ -1694,6 +1699,57 @@ class FipsCfg(object):
         syslog.syslog(syslog.LOG_INFO, f'FipsCfg: update the FIPS enforce option {self.enforce}.')
         loader.set_fips(image, self.enforce)
 
+class HostsAccessCfg:
+    def __init__(self):
+        pass
+
+    def render_allow_conf_file(self, hosts_access):
+        try:
+            template_file = os.path.abspath(HOSTS_ALLOW_TEMPLATE)
+            env = jinja2.Environment(loader=jinja2.FileSystemLoader('/'), trim_blocks=True)
+            env.filters['sub'] = sub
+            template = env.get_template(template_file)
+
+            allow_conf = template.render(hosts_access)
+
+            with open(HOSTS_ALLOW_FILE + ".tmp", 'w') as f:
+                f.write(allow_conf)
+            os.chmod(HOSTS_ALLOW_FILE + ".tmp", 0o644)
+            os.rename(HOSTS_ALLOW_FILE + ".tmp", HOSTS_ALLOW_FILE)
+        except Exception as e:
+            syslog.syslog(syslog.LOG_ERR, f'Failed render_allow_conf_file error={e}')
+    
+    def render_deny_conf_file(self, hosts_access):
+        try:
+            template_file = os.path.abspath(HOSTS_DENY_TEMPLATE)
+            env = jinja2.Environment(loader=jinja2.FileSystemLoader('/'), trim_blocks=True)
+            env.filters['sub'] = sub
+            template = env.get_template(template_file)
+
+            deny_conf = template.render(hosts_access)
+
+            with open(HOSTS_DENY_FILE + ".tmp", 'w') as f:
+                f.write(deny_conf)
+            os.chmod(HOSTS_DENY_FILE + ".tmp", 0o644)
+            os.rename(HOSTS_DENY_FILE + ".tmp", HOSTS_DENY_FILE)
+        except Exception as e:
+            syslog.syslog(syslog.LOG_ERR, f'Failed render_deny_conf_file error={e}')
+
+    def load(self, data):
+        hosts_access = {'HOSTS_ACCESS': data}
+        self.render_allow_conf_file(hosts_access)
+        self.render_deny_conf_file(hosts_access)
+
+    def hosts_access_handler(self, key, data):
+        hosts_access = {'HOSTS_ACCESS': { key: data }}
+        if key == 'allow':
+            self.render_allow_conf_file(hosts_access)
+        elif key == 'deny':
+            self.render_deny_conf_file(hosts_access)
+        else:
+            syslog.syslog(syslog.LOG_ERR, f'HostsAccessCfg : unknown key {key}')
+
+
 class HostConfigDaemon:
     def __init__(self):
         self.state_db_conn = DBConnector(STATE_DB, 0)
@@ -1745,6 +1801,9 @@ class HostConfigDaemon:
         # Initialize FipsCfg
         self.fipscfg = FipsCfg(self.state_db_conn)
 
+        # Initialize HostsAccessCfg
+        self.hostsAccessCfg = HostsAccessCfg()
+
     def load(self, init_data):
         aaa = init_data['AAA']
         tacacs_global = init_data['TACPLUS']
@@ -1767,6 +1826,7 @@ class HostConfigDaemon:
         ntp_global = init_data.get(swsscommon.CFG_NTP_GLOBAL_TABLE_NAME)
         ntp_servers = init_data.get(swsscommon.CFG_NTP_SERVER_TABLE_NAME)
         ntp_keys = init_data.get(swsscommon.CFG_NTP_KEY_TABLE_NAME)
+        hosts_access = init_data['HOSTS_ACCESS']
 
         self.aaacfg.load(aaa, tacacs_global, tacacs_server, radius_global, radius_server, ldap_global, ldap_server)
         self.iptables.load(lpbk_table)
@@ -1780,6 +1840,7 @@ class HostConfigDaemon:
         self.dnscfg.load(dns)
         self.fipscfg.load(fips_cfg)
         self.ntpcfg.load(ntp_global, ntp_servers, ntp_keys)
+        self.hostsAccessCfg.load(hosts_access)
 
         # Update AAA with the hostname
         self.aaacfg.hostname_update(self.devmetacfg.hostname)
@@ -1926,6 +1987,10 @@ class HostConfigDaemon:
         data = self.config_db.get_table("FIPS")
         self.fipscfg.fips_handler(data)
 
+    def hosts_access_handler(self, key, op, data):
+        syslog.syslog(syslog.LOG_INFO, 'Hosts access handler...')
+        self.hostsAccessCfg.hosts_access_handler(key, data)
+
     def wait_till_system_init_done(self):
         # No need to print the output in the log file so using the "--quiet"
         # flag
@@ -1990,6 +2055,9 @@ class HostConfigDaemon:
                                  make_callback(self.ntp_srv_key_handler))
         self.config_db.subscribe(swsscommon.CFG_NTP_KEY_TABLE_NAME,
                                  make_callback(self.ntp_srv_key_handler))
+
+        # Handle HOSTS_ACCESS change
+        self.config_db.subscribe('HOSTS_ACCESS', make_callback(self.hosts_access_handler))
 
         syslog.syslog(syslog.LOG_INFO,
                       "Waiting for systemctl to finish initialization")
